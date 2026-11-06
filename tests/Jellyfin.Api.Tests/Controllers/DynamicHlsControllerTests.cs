@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Controllers;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -36,7 +37,7 @@ namespace Jellyfin.Api.Tests.Controllers
                 Hdr10PlusPresentFlag = hdr10Plus
             };
 
-            Assert.Equal(expected, DynamicHlsController.GetDolbyVisionHevcCodecTag(stream));
+            Assert.Equal(expected, HlsCommandBuilder.GetDolbyVisionHevcCodecTag(stream));
         }
 
         [Theory]
