@@ -31,7 +31,7 @@ public class TranscodeTestStreamResult
     public double? OutputMbps { get; set; }
 
     /// <summary>
-    /// Gets or sets the status: running, stopped or failed.
+    /// Gets or sets the status: running, stopped, failed, or notStarted when it ended without producing a frame.
     /// </summary>
     public string Status { get; set; } = string.Empty;
 }

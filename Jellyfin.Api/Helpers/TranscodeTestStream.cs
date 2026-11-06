@@ -20,9 +20,11 @@ internal sealed partial class TranscodeTestStream
     /// </summary>
     internal const double WindowSeconds = 3;
 
+    private const int TailLines = 5;
     private const int ErrorLineCount = 4;
     private readonly object _lock = new();
     private readonly Queue<(double Time, long Frame)> _points = new();
+    private readonly Queue<string> _tail = new();
     private readonly Queue<string> _errors = new();
     private readonly List<double> _samples = [];
     private readonly HashSet<string> _counted = new(StringComparer.Ordinal);
@@ -30,6 +32,14 @@ internal sealed partial class TranscodeTestStream
     private int _outputSegments;
     private bool _disposed;
     private int _exitCode;
+    private string? _sessionLimitLine;
+    private string? _gpuMemoryLine;
+    private bool _reportedFrames;
+    private double? _firstFrameAt;
+    private double? _lastLineAt;
+    private double? _inputAt;
+    private bool _startedBefore;
+    private bool _sawMapping;
 
     public TranscodeTestStream(int id, Process process, string folder, string filePrefix, float sourceFps, double startedAt, int segmentLength)
     {
@@ -60,6 +70,11 @@ internal sealed partial class TranscodeTestStream
 
     public bool Handled { get; set; }
 
+    /// <summary>
+    /// Gets or sets a value indicating whether the time to the first frame was logged.
+    /// </summary>
+    public bool FirstFrameLogged { get; set; }
+
     public bool HasExited => _disposed || Process.HasExited;
 
     /// <summary>
@@ -84,6 +99,122 @@ internal sealed partial class TranscodeTestStream
             lock (_lock)
             {
                 return _errors.ToArray();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets what ffmpeg last said, for a stream that never produced frames: its error lines, or else its last few
+    /// lines of any kind. Empty when it printed nothing.
+    /// </summary>
+    public string StallEvidence
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return SelectEvidence(string.Join(" | ", _errors), _tail.ToArray());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the first line in which ffmpeg printed NVIDIA's session refusal text, or null. Kept for the stream's life,
+    /// however many lines follow it.
+    /// </summary>
+    public string? SessionLimitLine
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _sessionLimitLine;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the first line in which ffmpeg said the GPU ran out of memory, or null. Kept for the stream's life.
+    /// </summary>
+    public string? GpuMemoryLine
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _gpuMemoryLine;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether ffmpeg reported at least one encoded frame.
+    /// </summary>
+    public bool ReportedFrames
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _reportedFrames;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets when ffmpeg reported the first encoded frame, in seconds since the test started, or null before that.
+    /// </summary>
+    public double? FirstFrameAt
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _firstFrameAt;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether ffmpeg opened the input, which it says with "Input #0" once it has read enough
+    /// of the file to know its streams.
+    /// </summary>
+    public bool SawInput
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _inputAt.HasValue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether ffmpeg printed no line at all.
+    /// </summary>
+    public bool PrintedNothing
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _lastLineAt is null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether the stream produced frames, in this process or in one before it that reached
+    /// the end of the file.
+    /// </summary>
+    public bool EverReportedFrames
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _reportedFrames || _startedBefore;
             }
         }
     }
@@ -160,18 +291,38 @@ internal sealed partial class TranscodeTestStream
         Process.Dispose();
     }
 
+    /// <summary>
+    /// Gets the frame rate over the last few seconds.
+    /// </summary>
+    /// <param name="now">Seconds since the test started.</param>
+    /// <returns>The frame rate; 0 when ffmpeg reported frames but then went silent; <c>null</c> before it can be
+    /// measured, which is until a full window has passed since the first frame, so the encoder's start is not
+    /// judged.</returns>
     public double? Fps(double now)
     {
         lock (_lock)
         {
-            if (_points.Count < 2)
+            if (_points.Count == 0)
             {
                 return null;
             }
 
             var (t0, f0) = _points.First();
             var (t1, f1) = _points.Last();
-            if (t1 - t0 < WindowSeconds / 2 || now - t1 > Math.Max(WindowSeconds, 2))
+            if (now - t1 > Math.Max(WindowSeconds, 2))
+            {
+                // ffmpeg prints a progress line twice a second while it runs, so a started stream this quiet has stopped.
+                return _reportedFrames ? 0 : null;
+            }
+
+            // A new process, also one started again at the end of the file, warms up first: only readings from a
+            // full window after its first frame count.
+            if (_firstFrameAt is not double first || now - first < WindowSeconds || t0 < first)
+            {
+                return null;
+            }
+
+            if (_points.Count < 2 || t1 - t0 < WindowSeconds / 2)
             {
                 return null;
             }
@@ -193,6 +344,55 @@ internal sealed partial class TranscodeTestStream
     }
 
     /// <summary>
+    /// Describes how long the stream took to its first frame, split at the time ffmpeg opened the file when it said so.
+    /// </summary>
+    /// <param name="bytesRead">The bytes ffmpeg has read, or null when they are not known.</param>
+    /// <returns>One line for the log, or null before the first frame.</returns>
+    public string? DescribeFirstFrame(long? bytesRead)
+    {
+        lock (_lock)
+        {
+            if (_firstFrameAt is not double first)
+            {
+                return null;
+            }
+
+            var read = bytesRead is long b ? $" ({TranscodeTestProcessIo.FormatBytes(b)} read)" : string.Empty;
+            return _inputAt is double input && input <= first
+                ? string.Create(CultureInfo.InvariantCulture, $"Stream {Id}: opened the file within {input - StartedAt:0.0} s; first frame {first - input:0.0} s later{read}.")
+                : string.Create(CultureInfo.InvariantCulture, $"Stream {Id}: first frame within {first - StartedAt:0.0} s{read}.");
+        }
+    }
+
+    /// <summary>
+    /// Describes how far a stream that produced no frames got: whether ffmpeg opened the file and reached its stream
+    /// mapping, how long it has been quiet, how much CPU time it used and how much it read. One short line when ffmpeg
+    /// printed nothing.
+    /// </summary>
+    /// <param name="now">Seconds since the test started.</param>
+    /// <param name="processorTime">ffmpeg's CPU time, or null when it could not be read.</param>
+    /// <param name="bytesRead">The bytes ffmpeg has read, or null when they are not known.</param>
+    /// <returns>One line for the log.</returns>
+    public string StallDiagnostics(double now, TimeSpan? processorTime, long? bytesRead)
+    {
+        lock (_lock)
+        {
+            var cpu = processorTime is TimeSpan p ? string.Create(CultureInfo.InvariantCulture, $"CPU time {p.TotalSeconds:0.0} s") : "CPU time unknown";
+            var read = bytesRead is long b ? $"{TranscodeTestProcessIo.FormatBytes(b)} read" : null;
+            if (_lastLineAt is not double t)
+            {
+                var usage = read is null ? cpu : cpu + ", " + read;
+                return string.Create(CultureInfo.InvariantCulture, $"Stream {Id} printed nothing in {now - StartedAt:0.0} s ({usage}).");
+            }
+
+            var details = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Stream {Id} after {now - StartedAt:0.0} s: opened the file: {(_inputAt.HasValue ? "yes" : "no")}; reached stream mapping: {(_sawMapping ? "yes" : "no")}; last output {now - t:0.0} s ago; {cpu}");
+            return read is null ? details + "." : details + "; " + read + ".";
+        }
+    }
+
+    /// <summary>
     /// Takes over the output and frame rate samples of the process this one replaces, when a stream is started again
     /// at the end of the file, so the stream's output bitrate and median frame rate cover its whole run.
     /// </summary>
@@ -203,15 +403,18 @@ internal sealed partial class TranscodeTestStream
         long bytes;
         int segments;
         double[] samples;
+        bool started;
         lock (previous._lock)
         {
             bytes = previous._outputBytes;
             segments = previous._outputSegments;
             samples = previous._samples.ToArray();
+            started = previous._reportedFrames || previous._startedBefore;
         }
 
         lock (_lock)
         {
+            _startedBefore |= started;
             _outputBytes += bytes;
             _outputSegments += segments;
             _samples.InsertRange(0, samples);
@@ -274,8 +477,10 @@ internal sealed partial class TranscodeTestStream
     private int SegmentNumber(string path)
         => int.TryParse(Path.GetFileNameWithoutExtension(path).AsSpan(FilePrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out var number) ? number : -1;
 
-    private void OnLine(string line, double now)
+    internal void OnLine(string line, double now)
     {
+        // The stress command adds "-loglevel +level", so ffmpeg tags each line with its level; the tag is removed here.
+        (var level, line) = SplitLevel(line);
         var match = FrameRegex().Match(line);
         if (match.Success && long.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var frame))
         {
@@ -287,6 +492,13 @@ internal sealed partial class TranscodeTestStream
                 }
 
                 _points.Enqueue((now, frame));
+                _lastLineAt = now;
+                if (frame >= 1 && !_reportedFrames)
+                {
+                    _reportedFrames = true;
+                    _firstFrameAt = now;
+                }
+
                 while (_points.Count > 2 && now - _points.ElementAt(1).Time >= WindowSeconds)
                 {
                     _points.Dequeue();
@@ -296,7 +508,37 @@ internal sealed partial class TranscodeTestStream
             return;
         }
 
-        if (line.Contains("rror", StringComparison.Ordinal) || line.Contains("ailed", StringComparison.Ordinal) || line.Contains("nvalid", StringComparison.Ordinal))
+        if (!string.IsNullOrWhiteSpace(line))
+        {
+            var trimmed = line.Trim();
+            lock (_lock)
+            {
+                _lastLineAt = now;
+                if (_inputAt is null && trimmed.StartsWith("Input #0", StringComparison.Ordinal))
+                {
+                    _inputAt = now;
+                }
+
+                _sawMapping |= trimmed.StartsWith("Stream mapping:", StringComparison.Ordinal);
+                // Checked as each line arrives: the kept error text below may lose the line that names the cause.
+                if (_sessionLimitLine is null && TranscodeTestRules.IsSessionLimitText(trimmed))
+                {
+                    _sessionLimitLine = trimmed;
+                }
+                else if (_gpuMemoryLine is null && TranscodeTestRules.IsGpuMemoryLine(trimmed))
+                {
+                    _gpuMemoryLine = trimmed;
+                }
+
+                _tail.Enqueue(trimmed);
+                while (_tail.Count > TailLines)
+                {
+                    _tail.Dequeue();
+                }
+            }
+        }
+
+        if (IsErrorLine(level, line))
         {
             var error = line.Trim();
             lock (_lock)
@@ -314,6 +556,46 @@ internal sealed partial class TranscodeTestStream
         }
     }
 
+    /// <summary>
+    /// Splits ffmpeg's level tag from a line printed with "-loglevel +level".
+    /// </summary>
+    /// <param name="line">One line of ffmpeg output, such as "[h264_nvenc @ 0x0] [error] OpenEncodeSessionEx failed".</param>
+    /// <returns>The level, or null when the line has no tag, and the line without the tag.</returns>
+    internal static (string? Level, string Text) SplitLevel(string line)
+    {
+        var match = LevelRegex().Match(line);
+        return match.Success ? (match.Groups[2].Value, match.Groups[1].Value + line[match.Length..]) : (null, line);
+    }
+
+    /// <summary>
+    /// Gets whether a line is one of ffmpeg's errors.
+    /// </summary>
+    /// <remarks>
+    /// A tagged line is an error at error level or worse, so warnings such as a remux's "Invalid Block Addition value"
+    /// are never reported as the cause. Some libraries print straight to stderr without a tag; those fall back to
+    /// matching words that errors contain.
+    /// </remarks>
+    /// <param name="level">The line's level, or null when it has no tag.</param>
+    /// <param name="text">The line without its tag.</param>
+    /// <returns><c>true</c> for an error.</returns>
+    internal static bool IsErrorLine(string? level, string text)
+        => level is null
+            ? text.Contains("rror", StringComparison.Ordinal) || text.Contains("ailed", StringComparison.Ordinal) || text.Contains("nvalid", StringComparison.Ordinal)
+            : level is "panic" or "fatal" or "error";
+
+    /// <summary>
+    /// Picks the evidence for a stalled stream: its error lines, or else its last few lines.
+    /// </summary>
+    /// <param name="lastError">The stream's error lines.</param>
+    /// <param name="tail">Its last lines that were not progress lines.</param>
+    /// <returns>The evidence, or an empty string.</returns>
+    internal static string SelectEvidence(string lastError, IEnumerable<string> tail)
+        => !string.IsNullOrWhiteSpace(lastError) ? lastError : string.Join(" | ", tail);
+
     [GeneratedRegex(@"^frame=\s*(\d+)")]
     private static partial Regex FrameRegex();
+
+    // ffmpeg prints the level after any context prefixes: "[ctx @ 0x0] [sub @ 0x0] [error] message" or "[info] message".
+    [GeneratedRegex(@"^((?:\[[^\[\]]*\] )*)\[(panic|fatal|error|warning|info|verbose|debug|trace)\] ")]
+    private static partial Regex LevelRegex();
 }

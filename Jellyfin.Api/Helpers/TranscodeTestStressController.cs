@@ -14,6 +14,8 @@ namespace Jellyfin.Api.Helpers;
 /// has kept up for <see cref="SettleSeconds"/> since any of them was last below the threshold, so brief dips at the
 /// limit delay the next stream without holding it back for good. A stream that stays below for
 /// <see cref="FailSeconds"/> ends the test.
+/// Only a stream that never reported a frame stalls; one that reported frames and then went quiet reads 0 fps, so it
+/// gets the same grace as any stream that falls behind.
 /// A stream started again at the end of the file is judged afresh: its time below the threshold starts over, and
 /// until its new process is measured it neither counts as below nor holds back the next stream.
 /// </remarks>
@@ -88,7 +90,7 @@ internal sealed class TranscodeTestStressController
     public TranscodeTestStressDecision Tick(double now, IReadOnlyList<TranscodeTestStreamReading> streams)
     {
         ArgumentNullException.ThrowIfNull(streams);
-        var stalled = streams.FirstOrDefault(s => s.Fps is null && s.AgeSeconds > StartTimeoutSeconds);
+        var stalled = streams.FirstOrDefault(s => !s.ReportedFrames && s.Fps is null && s.AgeSeconds > StartTimeoutSeconds);
         if (stalled is not null)
         {
             return new(TranscodeTestStressAction.Stalled, TranscodeTestStressPhase.Finished, StreamId: stalled.Id);
