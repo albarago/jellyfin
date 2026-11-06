@@ -2,7 +2,9 @@ using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using Jellyfin.Api.Helpers;
+using Jellyfin.Api.Models.TranscodeTestDtos;
 using Xunit;
 
 namespace Jellyfin.Api.Tests.Helpers
@@ -72,6 +74,69 @@ namespace Jellyfin.Api.Tests.Helpers
             Assert.Equal(1.0, result.Streams[0].OutputMbps);
             Assert.Equal(2.0, result.Streams[1].OutputMbps);
             Assert.Equal(1.5, result.AverageOutputMbps);
+        }
+
+        [Fact]
+        public void SingleStream_AfterARestart_KeepsTheFirstProcessesMeasurement()
+        {
+            var run = new TranscodeTestStressRun(8);
+            var ended = Stream(1, "a_", 0, 0);
+            for (var t = 1.0; t <= 10; t += 0.5)
+            {
+                ended.OnLine(FormattableString.Invariant($"frame= {(int)(t * 30)} fps= 30"), t);
+                if (t % 1 == 0)
+                {
+                    ended.Sample(t);
+                }
+            }
+
+            var restarted = Stream(1, "b_", 0, 0);
+            restarted.CarryOver(ended);
+            run.Add(ended);
+            run.Add(restarted);
+
+            // The new process has no reading of its own yet.
+            Assert.Null(restarted.Fps(11));
+            run.RecordSingleStream(11);
+
+            Assert.Equal(30, run.Snapshot(11).SingleStreamFps);
+            Assert.Equal(30, run.Snapshot(11).Streams[0].MedianFps);
+        }
+
+        [Fact]
+        public void Snapshot_AStreamThatEndedWithoutFrames_DidNotStart()
+        {
+            var run = new TranscodeTestStressRun(8);
+            var started = Stream(1, "a_", 0, 0);
+            started.OnLine("frame=   10 fps= 24", 2);
+            var stalled = Stream(2, "b_", 0, 0);
+            run.Add(started);
+            run.Add(stalled);
+
+            Assert.Equal(["running", "running"], run.Snapshot(5).Streams.Select(s => s.Status));
+
+            run.End(TranscodeTestEndReason.StreamStalled, 35, 2, waitingOnInput: true);
+            var result = run.Snapshot(35);
+
+            Assert.Equal(["running", "notStarted"], result.Streams.Select(s => s.Status));
+            Assert.True(result.WaitingOnInput);
+        }
+
+        [Fact]
+        public void Snapshot_ARestartedStreamThatProducedFramesBefore_Started()
+        {
+            var run = new TranscodeTestStressRun(8);
+            var ended = Stream(1, "a_", 0, 0);
+            ended.OnLine("frame=   10 fps= 24", 2);
+            var restarted = Stream(1, "b_", 0, 0);
+            restarted.CarryOver(ended);
+            run.Add(ended);
+            run.Add(restarted);
+
+            run.End(TranscodeTestEndReason.Cancelled, 10);
+
+            Assert.Equal("running", run.Snapshot(10).Streams[0].Status);
+            Assert.False(run.Snapshot(10).WaitingOnInput);
         }
 
         // A running process, so the stream reads as running.

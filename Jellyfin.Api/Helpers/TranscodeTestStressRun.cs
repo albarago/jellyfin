@@ -22,6 +22,8 @@ internal sealed class TranscodeTestStressRun
     private int? _behindStreamId;
     private double? _endsAt;
     private double? _singleStreamFps;
+    private bool _couldNotStartStream;
+    private bool _waitingOnInput;
 
     public TranscodeTestStressRun(int maxStreams)
     {
@@ -55,6 +57,12 @@ internal sealed class TranscodeTestStressRun
     /// so streams restart often.
     /// </summary>
     public bool ShortSource { get; set; }
+
+    /// <summary>
+    /// Gets the id of the most recently added stream. A stream restarted at the end of the file keeps its id and
+    /// does not change this.
+    /// </summary>
+    public int LastStreamId => _lastStreamId;
 
     public int NextStreamId() => ++_lastStreamId;
 
@@ -130,7 +138,9 @@ internal sealed class TranscodeTestStressRun
     /// <param name="streamId">The stream that fell behind or failed.</param>
     /// <param name="fps">The frame rate of the stream that fell behind.</param>
     /// <param name="error">The error, if any.</param>
-    public void End(TranscodeTestEndReason reason, double now, int? streamId = null, double? fps = null, string? error = null)
+    /// <param name="couldNotStartStream">Whether the newest stream never started after others kept up.</param>
+    /// <param name="waitingOnInput">Whether the stream that stalled was waiting on reading the file.</param>
+    public void End(TranscodeTestEndReason reason, double now, int? streamId = null, double? fps = null, string? error = null, bool couldNotStartStream = false, bool waitingOnInput = false)
     {
         lock (_lock)
         {
@@ -156,6 +166,8 @@ internal sealed class TranscodeTestStressRun
             _failedStreamId = streamId;
             _failedStreamFps = fps.HasValue ? TranscodeTestRules.RoundFps(fps.Value, ThresholdFps) : null;
             _error = error;
+            _couldNotStartStream = couldNotStartStream;
+            _waitingOnInput = waitingOnInput;
         }
     }
 
@@ -215,12 +227,15 @@ internal sealed class TranscodeTestStressRun
                 EndsInSeconds = _endsAt.HasValue ? Math.Max(0, Math.Round(_endsAt.Value - now, 1)) : null,
                 RampSeconds = TranscodeTestManager.RampSeconds,
                 FailSeconds = TranscodeTestManager.FailSeconds,
+                StartTimeoutSeconds = TranscodeTestManager.StartTimeoutSeconds,
                 ThresholdFps = ThresholdFps,
                 FpsRatio = TranscodeTestManager.FpsRatio,
                 SourceFps = SourceFps,
                 SingleStreamFps = _singleStreamFps,
                 SingleStreamSpeed = _singleStreamFps.HasValue && SourceFps > 0 ? Math.Round(_singleStreamFps.Value / SourceFps, 2) : null,
                 SurveyFailureReason = TranscodeTestRules.SurveyFailureReason(EndReason),
+                CouldNotStartStream = _couldNotStartStream,
+                WaitingOnInput = _waitingOnInput,
                 FailedStreamId = _failedStreamId,
                 FailedStreamFps = _failedStreamFps,
                 StreamsAtEnd = _streamsAtEnd,
@@ -237,9 +252,31 @@ internal sealed class TranscodeTestStressRun
                     FinalFps = s.FinalFps,
                     MedianFps = s.MedianFps,
                     OutputMbps = s.OutputMbps,
-                    Status = s.HasExited ? (s.Stopping || s.ExitCode == 0 ? "stopped" : "failed") : "running"
+                    Status = StreamStatus(s, finished)
                 }).ToArray()
             };
         }
+    }
+
+    /// <summary>
+    /// Gets a stream's status for the result.
+    /// </summary>
+    /// <param name="stream">The stream, as its newest process.</param>
+    /// <param name="finished">Whether the test has ended.</param>
+    /// <returns><c>failed</c> when ffmpeg exited with an error; <c>notStarted</c> when it ended without ever producing
+    /// a frame; otherwise <c>stopped</c> or <c>running</c>.</returns>
+    internal static string StreamStatus(TranscodeTestStream stream, bool finished)
+    {
+        if (stream.HasExited && !stream.Stopping && stream.ExitCode != 0)
+        {
+            return "failed";
+        }
+
+        if (!stream.EverReportedFrames && (finished || stream.HasExited))
+        {
+            return "notStarted";
+        }
+
+        return stream.HasExited ? "stopped" : "running";
     }
 }
